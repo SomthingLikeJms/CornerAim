@@ -1,10 +1,10 @@
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, replace
-from math import ceil, copysign, cos, radians, sqrt, tan
+from math import ceil, copysign, cos, hypot, pi, radians, sin, sqrt, tan, tau
 from random import Random
 from statistics import median
 
-from corneraim.camera import Camera, Vector, direction, dot
+from corneraim.camera import PITCH_LIMIT, Camera, Vector, direction, dot
 
 COUNTDOWN = 1.5
 TARGET_RADIUS = 0.65
@@ -15,6 +15,9 @@ REACTION_MIN = 0.08
 REACTION_LIMIT = 1.5
 GRID_SLOTS = tuple((x * 2.7, y * 2.7) for y in (-1, 0, 1) for x in (-2, -1, 0, 1, 2))
 GRID_REFILL_ALIGNMENT = cos(radians(4.5))
+TRACKING_AREA_RADIUS = 4.5
+TRACKING_SPEEDS = {"easy": 5.0, "medium": 8.0, "hard": 11.0}
+TRACKING_MAX_SAMPLE_INTERVAL = 0.1
 
 
 @dataclass(frozen=True)
@@ -31,6 +34,7 @@ MODES = {
     "headline": Mode("爆头线微调", "爆头线", "同一高度左右微调", 0.55, "上靶"),
     "gridshot": Mode("三球微调", "三球", "三靶并存，命中补位", 0.78, "连击"),
     "reaction": Mode("视觉反应", "反应", "随机亮球，见球即点", 1.15, "反应"),
+    "tracking": Mode("微调跟枪", "跟枪", "准星贴住移动小球", 0.9, ""),
 }
 
 DEFAULT_DIFFICULTY = "medium"
@@ -61,6 +65,20 @@ def p90(samples: tuple[float, ...] | list[float]) -> float | None:
 
 
 @dataclass(frozen=True)
+class TrackingScore:
+    on_target_seconds: float
+    seconds: float
+
+    @property
+    def ratio(self) -> float:
+        return min(1.0, self.on_target_seconds / self.seconds) if self.seconds else 0.0
+
+    @property
+    def points(self) -> int:
+        return round(self.on_target_seconds * 100)
+
+
+@dataclass(frozen=True)
 class Result:
     hits: int
     shots: int
@@ -68,6 +86,7 @@ class Result:
     samples_ms: tuple[float, ...] = ()
     false_starts: int = 0
     timeouts: int = 0
+    tracking: TrackingScore | None = None
 
     @property
     def accuracy(self) -> float:
@@ -117,6 +136,9 @@ class Drill(ABC):
         pass
 
     def resume(self, now: float) -> None:
+        pass
+
+    def settle_score(self, now: float) -> None:
         pass
 
     def result(self) -> Result:
@@ -284,6 +306,93 @@ class ReactionTest(Drill):
         self._schedule(now)
 
 
+class Tracking(Drill):
+    def __init__(
+        self, now: float, duration: float, degrees_per_count: float, rng: Random | None = None,
+        *, difficulty: str = DEFAULT_DIFFICULTY,
+    ) -> None:
+        super().__init__(now, duration, degrees_per_count, rng, "tracking", difficulty)
+        self.on_target = False
+        self.on_target_seconds = 0.0
+        self.sample_at = self.starts_at
+
+    @property
+    def score(self) -> TrackingScore:
+        elapsed = min(self.duration, self.sample_at - self.starts_at)
+        return TrackingScore(min(self.on_target_seconds, elapsed), elapsed)
+
+    def _random_point(self, inner_radius: float = 0.0) -> tuple[float, float]:
+        radius = sqrt(self.rng.uniform(inner_radius ** 2, TRACKING_AREA_RADIUS ** 2))
+        angle = self.rng.uniform(0, tau)
+        return radius * cos(angle), radius * sin(angle)
+
+    def _begin_path(self, now: float) -> None:
+        yaw = self.camera.yaw
+        pitch_limit = PITCH_LIMIT - TRACKING_AREA_RADIUS
+        pitch = max(-pitch_limit, min(pitch_limit, self.camera.pitch))
+        self.path_basis = direction(yaw, pitch), direction(yaw + 90, 0), direction(yaw, pitch + 90)
+        self.path_started_at = now
+        self.destination = self._random_point(inner_radius=2.0)
+        self._next_segment(now)
+        self.lost_since = None
+
+    def _next_segment(self, now: float) -> None:
+        start_x, start_y = self.destination
+        while True:
+            x, y = self._random_point()
+            length = hypot(x - start_x, y - start_y)
+            if length >= 1.8:
+                break
+        self.segment_origin = self.destination
+        self.destination = x, y
+        self.segment_started_at = now
+        self.segment_ends_at = now + length / TRACKING_SPEEDS[self.difficulty]
+
+    def _target_at(self, now: float) -> Target:
+        # Use the scheduled arrival times even if a frame skips a waypoint.
+        while now >= self.segment_ends_at:
+            self._next_segment(self.segment_ends_at)
+        progress = (now - self.segment_started_at) / (self.segment_ends_at - self.segment_started_at)
+        if self.difficulty == "hard":
+            progress = (1 - cos(pi * progress)) / 2
+        start_x, start_y = self.segment_origin
+        end_x, end_y = self.destination
+        x = tan(radians(start_x + (end_x - start_x) * progress))
+        y = tan(radians(start_y + (end_y - start_y) * progress))
+        a, b, c = (forward + x * right + y * up for forward, right, up in zip(*self.path_basis))
+        length = sqrt(1 + x * x + y * y)
+        return Target((a / length, b / length, c / length), self.path_started_at)
+
+    def settle_score(self, now: float) -> None:
+        until = min(now, self.ends_at)
+        if until <= self.sample_at:
+            return
+        # A stalled frame cannot establish that the player tracked the ball throughout the gap.
+        if self.on_target:
+            self.on_target_seconds += min(until - self.sample_at, TRACKING_MAX_SAMPLE_INTERVAL)
+        self.sample_at = until
+
+    def update(self, now: float) -> None:
+        self.settle_score(now)
+        if not self.active(now):
+            return
+        if not self.targets:
+            self._begin_path(now)
+        target = self._target_at(now)
+        self.targets = (target,)
+        if self.lost(now):
+            self._begin_path(now)
+            target = self._target_at(now)
+            self.targets = (target,)
+        self.on_target = dot(self.camera.forward, target.direction) >= self.hit_alignment
+
+    def fire(self, now: float) -> None:
+        pass
+
+    def result(self) -> Result:
+        return Result(0, 0, None, tracking=self.score)
+
+
 def start_drill(
     mode: str, now: float, seconds: float, degrees_per_count: float,
     *, difficulty: str = DEFAULT_DIFFICULTY,
@@ -292,4 +401,6 @@ def start_drill(
         return Gridshot(now, seconds, degrees_per_count, difficulty=difficulty)
     if mode == "reaction":
         return ReactionTest(now, seconds, degrees_per_count, difficulty=difficulty)
+    if mode == "tracking":
+        return Tracking(now, seconds, degrees_per_count, difficulty=difficulty)
     return Microflick(now, seconds, degrees_per_count, mode=mode, difficulty=difficulty)

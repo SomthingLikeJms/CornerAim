@@ -49,7 +49,7 @@ def _modes(area: pygame.Rect):
     width = (area.w - 10) // 2
     for index, key in enumerate(MODES):
         row, column = divmod(index, 2)
-        yield key, pygame.Rect(area.x + column * (width + 10), area.y + 43 + row * 56, width, 49)
+        yield key, pygame.Rect(area.x + column * (width + 10), area.y + 35 + row * 40, width, 36)
 
 
 def _difficulty_choices(area: pygame.Rect):
@@ -253,19 +253,28 @@ class SettingsPanel:
             pygame.draw.rect(screen.surface, ACTIVE_EDGE if selected else CONTROL_EDGE, rect, 1, border_radius=7)
             if selected:
                 pygame.draw.line(screen.surface, ACCENT, (rect.x + 3, rect.y + 10), (rect.x + 3, rect.bottom - 11), 2)
-            screen.label(mode.name, (rect.x + 11, rect.y + 3), 16, ACCENT if selected else TEXT)
-            screen.label(mode.description, (rect.x + 11, rect.y + 26), 13, SECONDARY)
+            screen.label(mode.name, (rect.x + 11, rect.y + 1), 15, ACCENT if selected else TEXT)
+            screen.label(mode.description, (rect.x + 11, rect.y + 19), 12, SECONDARY)
         screen.label("靶球难度", (area.x, area.y + 165), 13, MUTED, "midleft")
         for key, rect in _difficulty_choices(area):
             _button(screen, rect, DIFFICULTIES[key].name, active=key == self.difficulty)
         if not self.notice:
-            screen.label("保存后用于下一局", (area.x, area.y + 180), 12, MUTED)
+            hint = "保存后用于下一局 · 困难档会变速" if self.mode == "tracking" else "保存后用于下一局"
+            screen.label(hint, (area.x, area.y + 180), 12, MUTED)
 
     def _draw_stats(self, screen: Screen, area: pygame.Rect) -> None:
         for mode, rect in _stats_modes(area):
             _button(screen, rect, MODES[mode].short, active=mode == self.stats_mode)
         stats = self.stats
-        if self.stats_mode == "reaction":
+        if self.stats_mode == "tracking":
+            tracking = stats.tracking
+            cards = (
+                ("训练局数", str(stats.rounds)),
+                ("累计贴靶", f"{tracking.on_target_seconds:.1f} s" if tracking else "—"),
+                ("贴靶率", f"{tracking.ratio:.1%}" if tracking and tracking.seconds else "—"),
+            )
+            hint = "贴靶时间占实际练习时间的比例"
+        elif self.stats_mode == "reaction":
             cards = (
                 ("有效样本", str(stats.samples)),
                 ("中位反应", _milliseconds(stats.median_ms)),
@@ -306,8 +315,8 @@ class SettingsPanel:
         if not self.rows:
             screen.label("完成一局后，成绩会出现在这里。", (area.centerx, area.y + 95), 13, MUTED, "center")
             return
-        columns = [area.x + round(area.w * part) for part in (0, 0.30, 0.43, 0.55, 0.66, 0.82)]
-        for x, label in zip(columns, ("日期", "模式", "难度", "有效", "命中率", "中位耗时")):
+        columns = [area.x + round(area.w * part) for part in (0, 0.30, 0.43, 0.55, 0.70, 0.84)]
+        for x, label in zip(columns, ("日期", "模式", "难度", "成绩", "比率", "用时")):
             screen.label(label, (x, area.y + 42), 13, SECONDARY)
         pygame.draw.line(screen.surface, CONTROL_EDGE, (area.x, area.y + 61), (area.right - 1, area.y + 61))
         for index, row in enumerate(self.rows[:PAGE_SIZE]):
@@ -315,13 +324,17 @@ class SettingsPanel:
             result = row.result
             mode = MODES.get(row.mode)
             difficulty = DIFFICULTIES.get(row.difficulty, DIFFICULTIES[DEFAULT_DIFFICULTY])
+            if result.tracking is not None:
+                tracking = result.tracking
+                scores = (str(tracking.points), f"{tracking.ratio:.0%}", f"{tracking.on_target_seconds:.1f} s")
+            else:
+                accuracy = f"{result.accuracy:.0%}" if row.mode != "reaction" and result.shots else "—"
+                scores = (str(result.hits), accuracy, _milliseconds(result.median_ms))
             cells = (
                 row.played_at[2:16].replace("T", " "),
                 mode.short if mode else "未知",
                 difficulty.name,
-                str(result.hits),
-                f"{result.accuracy:.0%}" if row.mode != "reaction" and result.shots else "—",
-                _milliseconds(result.median_ms),
+                *scores,
             )
             for column, (x, value) in enumerate(zip(columns, cells)):
                 numeric = column not in (1, 2)

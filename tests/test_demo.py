@@ -1,11 +1,13 @@
 from itertools import combinations
-from math import acos, asin, atan2, degrees
+from math import acos, asin, atan2, degrees, hypot
 from random import Random
 
 import pytest
 
 from corneraim.camera import Camera, View, direction, dot
-from corneraim.drill import MODES, REACTION_LIMIT, TARGET_RADIUS, Gridshot, Microflick, ReactionTest, Target, start_drill
+from corneraim.drill import (
+    MODES, REACTION_LIMIT, TARGET_RADIUS, Gridshot, Microflick, ReactionTest, Target, Tracking, start_drill,
+)
 from corneraim.sens import CM360_EDPI, Sensitivity
 
 
@@ -205,3 +207,48 @@ def test_reaction_starts_at_presentation_and_separates_early_and_late_clicks():
     drill.resume(cue + 0.2)
     assert not drill.targets and drill.cue_at > cue + 0.2
     assert drill.result().samples_ms == pytest.approx((230,))
+
+
+def test_tracking_moves_in_random_directions_within_the_same_area():
+    speeds = []
+    for difficulty in ("easy", "medium", "hard"):
+        drill = Tracking(0, 30, 0.028, Random(4), difficulty=difficulty)
+        positions = []
+        for frame in range(1441):
+            drill.update(drill.starts_at + frame / 120)
+            x, y, z = drill.targets[0].direction
+            positions.append((degrees(atan2(x, z)), degrees(atan2(y, z))))
+        assert max(hypot(x, y) for x, y in positions) <= 4.5 + 1e-9
+        steps = [(bx - ax, by - ay) for (ax, ay), (bx, by) in zip(positions, positions[1:])]
+        quadrants = {(dx > 0, dy > 0) for dx, dy in steps if min(abs(dx), abs(dy)) > 1e-6}
+        assert len(quadrants) >= 3
+        speeds.append([hypot(dx, dy) * 120 for dx, dy in steps])
+
+        sparse = Tracking(0, 30, 0.028, Random(4), difficulty=difficulty)
+        sparse.update(sparse.starts_at)
+        sparse.update(sparse.starts_at + 12)
+        assert sparse.targets == drill.targets
+
+    easy, medium, hard = speeds
+    assert max(easy) == pytest.approx(5)
+    assert max(medium) == pytest.approx(8)
+    assert sum(speed == pytest.approx(5) for speed in easy) > 0.95 * len(easy)
+    assert sum(speed == pytest.approx(8) for speed in medium) > 0.95 * len(medium)
+    assert 8 < max(hard) < 18
+    assert min(hard) < 0.5
+    assert max(abs(b - a) for a, b in zip(hard, hard[1:])) < 3
+
+
+def test_tracking_does_not_credit_an_unobserved_frame_gap():
+    drill = Tracking(0, 5, 0.028, Random(4), difficulty="easy")
+    start = drill.starts_at
+    drill.update(start)
+    x, y, z = drill.targets[0].direction
+    drill.camera = Camera(degrees(atan2(x, z)), degrees(asin(y)))
+    drill.update(start)
+    drill.update(start + 0.05)
+    assert drill.result().tracking.on_target_seconds == pytest.approx(0.05)
+
+    drill.settle_score(drill.ends_at + 2)
+    assert drill.result().tracking.on_target_seconds <= 0.15 + 1e-9
+    assert drill.result().tracking.seconds == pytest.approx(5)

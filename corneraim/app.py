@@ -90,9 +90,11 @@ class Demo:
         if not self.captured:
             return
         now = perf_counter()
-        if now - self.pause_duration >= self.drill.ends_at:
+        round_now = now - self.pause_duration
+        if round_now >= self.drill.ends_at:
             self._finish(restore_cursor=restore_cursor)
             return
+        self.drill.settle_score(round_now)
         self.paused_at = now
         self._release(restore_cursor=restore_cursor)
         self.redraw = True
@@ -100,7 +102,9 @@ class Demo:
     def _finish(self, *, restore_cursor: bool = True) -> None:
         drill = self.drill
         was_captured = self.captured
-        elapsed = min(drill.duration, self._round_time() - drill.starts_at)
+        now = self._round_time()
+        elapsed = min(drill.duration, now - drill.starts_at)
+        drill.settle_score(now)
         self.last_result = drill.result()
         self.last_scenario = drill.mode, drill.difficulty
         self.restart_ready_at = None

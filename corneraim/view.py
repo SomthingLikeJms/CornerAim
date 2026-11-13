@@ -6,7 +6,7 @@ from pathlib import Path
 import pygame
 
 from corneraim.camera import View, direction
-from corneraim.drill import DEFAULT_DIFFICULTY, DIFFICULTIES, HIT_FLASH, MODES, Drill, Result
+from corneraim.drill import DEFAULT_DIFFICULTY, DIFFICULTIES, HIT_FLASH, MODES, Drill, Result, Tracking
 from corneraim.sens import Sensitivity
 
 START_SIZE = (640, 420)
@@ -90,13 +90,13 @@ def text_sprite(font: pygame.font.Font, text: str, color: tuple, outlined: bool)
 
 
 @lru_cache(maxsize=64)
-def _ball_sprite(radius: int) -> pygame.Surface:
+def _ball_sprite(radius: int, on_target: bool = False) -> pygame.Surface:
     size = 2 * radius + 3
     scale = 3
     large = pygame.Surface((size * scale, size * scale), pygame.SRCALPHA)
     center = large.get_rect().center
-    pygame.draw.circle(large, BALL, center, radius * scale)
-    pygame.draw.circle(large, BALL_CENTER, center, max(1, radius * scale // 3))
+    pygame.draw.circle(large, ACTIVE_EDGE if on_target else BALL, center, radius * scale)
+    pygame.draw.circle(large, ACCENT if on_target else BALL_CENTER, center, max(1, radius * scale // 3))
     return pygame.transform.smoothscale(large.premul_alpha(), (size, size))
 
 
@@ -162,7 +162,8 @@ class Screen:
 
         primary, *secondary = stats
         self.label(primary[0], (left + 13, top + 59), 14, SECONDARY, outline=stealth)
-        self.label(primary[1], (left + 12, top + 103), 44, TEXT, "midleft", outline=stealth, figures=True)
+        size = 44 if self.figures[44].size(primary[1])[0] <= split - left - 24 else 28
+        self.label(primary[1], (left + 12, top + 103), size, TEXT, "midleft", outline=stealth, figures=True)
         for index, (label, value) in enumerate(secondary):
             y = top + 73 + index * 32
             self.label(label, (split + 12, y), 14, SECONDARY, "midleft", outline=stealth)
@@ -205,7 +206,14 @@ class Screen:
         hits = str(result.hits) if result else "—"
         accuracy = f"{result.accuracy:.0%}" if result and result.shots else "—"
         timing = f"{result.median_ms:.0f} ms" if result and result.median_ms is not None else "—"
-        if mode == "reaction":
+        if mode == "tracking":
+            tracking = result.tracking if result else None
+            stats = (
+                ("得分", str(tracking.points) if tracking else "—"),
+                ("贴靶率", f"{tracking.ratio:.0%}" if tracking and tracking.seconds else "—"),
+                ("贴靶时长", f"{tracking.on_target_seconds:.1f} s" if tracking else "—"),
+            )
+        elif mode == "reaction":
             early = str(result.false_starts) if result else "—"
             stats = (("有效反应", hits), ("抢跑", early), ("中位反应", timing))
         else:
@@ -273,11 +281,19 @@ class Screen:
         hits = len(drill.hit_times)
         accuracy = f"{hits / drill.shots:.0%}" if drill.shots else "—"
         reaction = drill.mode == "reaction"
-        action = "见球即点" if reaction else "左键点射"
+        tracking = drill.score if isinstance(drill, Tracking) else None
+        if tracking is not None:
+            action = "贴住小球"
+            ratio = f"{tracking.ratio:.0%}" if tracking.seconds else "—"
+            status = f"得分 {tracking.points}  ·  贴靶率 {ratio}"
+        elif reaction:
+            action = "见球即点"
+            status = f"有效 {hits}  抢跑 {drill.false_starts}  超时 {drill.timeouts}"
+        else:
+            action = "左键点射"
+            status = f"命中 {hits}  ·  {accuracy}"
         timer = f"{remaining:04.1f} s"
-        reaction_status = f"有效 {hits}  抢跑 {drill.false_starts}  超时 {drill.timeouts}"
         if stealth:
-            status = reaction_status if reaction else f"命中 {hits}  ·  {accuracy}"
             self.label(status, (14, 8), 16, outline=True)
             self.label(timer, (w - 14, 8), anchor="topright", outline=True, mono=True)
             if not paused:
@@ -307,8 +323,8 @@ class Screen:
             return
 
         y = h - 23
-        if reaction:
-            self.label(reaction_status, (14, y), 15, TEXT, "midleft")
+        if reaction or tracking is not None:
+            self.label(status, (14, y), 15, TEXT, "midleft")
         else:
             score = str(hits)
             x = 21 + self.figures[26].size(score)[0]
@@ -346,6 +362,7 @@ class Screen:
                 radius = view.radius(drill.rules.radius, depth)
                 pygame.draw.circle(self.surface, color, (round(x), round(y)), radius + 2 + round(age * 4), 1)
         targets = () if stealth and paused else drill.targets
+        on_target = isinstance(drill, Tracking) and drill.on_target and not paused
         for target in targets:
             ball = view.project(target.direction, near=0.15)
             if ball is None:
@@ -353,7 +370,7 @@ class Screen:
             x, y, depth = ball
             radius = view.radius(drill.rules.radius, depth)
             if -radius <= x <= w + radius and -radius <= y <= h + radius:
-                sprite = _ball_sprite(radius)
+                sprite = _ball_sprite(radius, on_target)
                 self.surface.blit(sprite, sprite.get_rect(center=(round(x), round(y))),
                                   special_flags=pygame.BLEND_PREMULTIPLIED)
         self._training_hud(drill, remaining_time(drill, now), paused=paused, stealth=stealth)

@@ -1,4 +1,5 @@
 import ctypes
+from math import asin, atan2, degrees
 from random import Random
 from unittest.mock import Mock, call
 
@@ -9,7 +10,9 @@ from corneraim.app import pygame
 from corneraim.camera import View
 from corneraim.drill import Gridshot, ReactionTest, Result
 from corneraim.profile import LocalStore, Profile
-from corneraim.settings import _area, _difficulty_choices, _fields, _focus_choices, _modes, _stats_modes, _stealth_button, _tabs
+from corneraim.settings import (
+    _actions, _area, _difficulty_choices, _fields, _focus_choices, _modes, _stats_modes, _stealth_button, _tabs,
+)
 from corneraim.title import TITLE_HEIGHT, _buttons, title_surface
 from corneraim.view import (
     BALL_CENTER, CLEAR_HIT_AREA, CROSSHAIR, HFOV, MIN_SIZE, OUTLINE, START_SIZE, UNLOCK_HINT, Screen,
@@ -195,6 +198,60 @@ def test_stats_and_stealth_backdrop_are_accessible_from_settings(session, tmp_pa
     assert demo.store.load_profile().stealth
     assert demo.store.load_profile().focus_level == 2
     relative_mode.assert_not_called()
+
+
+def test_tracking_scores_without_clicks_and_persists_the_round(session, tmp_path, monkeypatch):
+    demo, clock, relative_mode, _ = session
+    demo.store = LocalStore(tmp_path)
+    demo.profile = Profile(seconds=5, stealth=True)
+    monkeypatch.setattr(pygame.display, "get_window_size", lambda: (MIN_SIZE[0], MIN_SIZE[1] + TITLE_HEIGHT))
+    click(demo, (dict(_buttons(MIN_SIZE[0]))["settings"].centerx, -10))
+    area = _area(MIN_SIZE)
+    click(demo, list(_tabs(area))[1].center)
+    click(demo, dict(_modes(area))["tracking"].center)
+    click(demo, dict(_difficulty_choices(area))["easy"].center)
+    click(demo, _actions(area)[1].center)
+    assert demo.profile.mode == "tracking" and demo.profile.difficulty == "easy"
+    relative_mode.assert_not_called()
+
+    click(demo)
+    drill = demo.drill
+    drill.update(demo._round_time())
+    assert not drill.targets and drill.score.points == 0
+    clock.return_value = drill.starts_at
+    drill.update(demo._round_time())
+    x, y, z = drill.targets[0].direction
+    dx = round(degrees(atan2(x, z)) / drill.degrees_per_count)
+    dy = round(-degrees(asin(y)) / drill.degrees_per_count)
+    demo._event(pygame.event.Event(pygame.MOUSEMOTION, rel=(dx, dy)))
+    drill.update(demo._round_time())
+    assert drill.on_target
+    clock.return_value += 0.1
+    drill.update(demo._round_time())
+    assert drill.score.points == 10
+    click(demo, allow_capture=False)
+    assert drill.score.points == 10 and drill.result().shots == 0
+
+    clock.return_value += 0.05
+    demo._event(pygame.event.Event(pygame.KEYDOWN, key=pygame.K_LALT))
+    assert not demo.captured and drill.score.points == 15
+    clock.return_value += 40
+    click(demo)
+    clock.return_value += 0.05
+    demo._event(pygame.event.Event(pygame.MOUSEMOTION, rel=(900, 0)))
+    drill.update(demo._round_time())
+    assert not drill.on_target and drill.score.points == 20
+
+    clock.return_value += 6
+    demo._finish()
+    assert not demo.captured and demo.last_result.tracking.seconds == pytest.approx(5)
+    assert demo.last_result.tracking.ratio == pytest.approx(0.04)
+    assert relative_mode.call_args_list == [call(True), call(False), call(True), call(False)]
+    reopened = LocalStore(tmp_path)
+    [row] = reopened.history(offset=0, limit=5)
+    assert row.mode == "tracking" and row.difficulty == "easy" and row.result == demo.last_result
+    assert reopened.statistics("tracking", difficulty="easy").tracking == row.result.tracking
+    assert reopened.statistics("tracking", difficulty="hard").rounds == 0
 
 
 def test_stealth_frames_show_an_outlined_aim_crosshair_over_the_clear_body():

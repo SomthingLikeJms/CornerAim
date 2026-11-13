@@ -8,7 +8,7 @@ from math import isfinite
 from pathlib import Path
 from statistics import median
 
-from corneraim.drill import DEFAULT_DIFFICULTY, DIFFICULTIES, MODES, Result, p90
+from corneraim.drill import DEFAULT_DIFFICULTY, DIFFICULTIES, MODES, Result, TrackingScore, p90
 from corneraim.sens import Sensitivity
 
 
@@ -63,18 +63,19 @@ class PersonalStats:
     best_ms: float | None = None
     false_starts: int = 0
     timeouts: int = 0
+    tracking: TrackingScore | None = None
 
     @property
     def hits_per_minute(self) -> float:
         return self.hits * 60 / self.seconds if self.seconds else 0.0
 
 
-def _details(raw: str | None) -> tuple[tuple[float, ...], int, int, str]:
+def _details(raw: str | None) -> tuple[tuple[float, ...], int, int, str, float | None]:
     if raw is None:
-        return (), 0, 0, DEFAULT_DIFFICULTY
+        return (), 0, 0, DEFAULT_DIFFICULTY, None
     detail = json.loads(raw)
     return (tuple(detail["samples_ms"]), detail["false_starts"], detail["timeouts"],
-            detail.get("difficulty", DEFAULT_DIFFICULTY))
+            detail.get("difficulty", DEFAULT_DIFFICULTY), detail.get("on_target_seconds"))
 
 
 class LocalStore:
@@ -138,6 +139,8 @@ class LocalStore:
             )
             detail = dict(samples_ms=result.samples_ms, false_starts=result.false_starts, timeouts=result.timeouts,
                           difficulty=difficulty)
+            if result.tracking is not None:
+                detail["on_target_seconds"] = result.tracking.on_target_seconds
             db.execute("INSERT INTO history_metrics VALUES (?, ?)", (row.lastrowid, json.dumps(detail)))
 
     def history(self, *, offset: int, limit: int) -> list[HistoryRow]:
@@ -151,15 +154,17 @@ class LocalStore:
             ).fetchall()
         history = []
         for at, mode, seconds, hits, shots, timing, raw in rows:
-            samples, early, late, difficulty = _details(raw)
-            history.append(HistoryRow(at, mode, seconds, Result(hits, shots, timing, samples, early, late), difficulty))
+            samples, early, late, difficulty, on_target = _details(raw)
+            tracking = TrackingScore(on_target, seconds) if on_target is not None else None
+            result = Result(hits, shots, timing, samples, early, late, tracking)
+            history.append(HistoryRow(at, mode, seconds, result, difficulty))
         return history
 
     def statistics(self, mode: str, *, difficulty: str | None = None) -> PersonalStats:
         if not self.path.is_file():
             return PersonalStats()
         rounds = hits = shots = false_starts = timeouts = 0
-        seconds = 0.0
+        seconds = on_target_seconds = 0.0
         samples = []
         with self._connection() as db:
             rows = db.execute(
@@ -167,7 +172,7 @@ class LocalStore:
                 "LEFT JOIN history_metrics m ON m.history_id=h.id WHERE h.mode=?", (mode,),
             )
             for duration, landed, fired, raw in rows:
-                timings, early, late, level = _details(raw)
+                timings, early, late, level, on_target = _details(raw)
                 if difficulty is not None and level != difficulty:
                     continue
                 rounds += 1
@@ -177,5 +182,8 @@ class LocalStore:
                 samples.extend(timings)
                 false_starts += early
                 timeouts += late
+                if on_target is not None:
+                    on_target_seconds += on_target
+        tracking = TrackingScore(on_target_seconds, seconds) if mode == "tracking" and rounds else None
         return PersonalStats(rounds, seconds, hits, shots, len(samples), median(samples) if samples else None,
-                             p90(samples), min(samples) if samples else None, false_starts, timeouts)
+                             p90(samples), min(samples) if samples else None, false_starts, timeouts, tracking)
